@@ -11,6 +11,7 @@
 零第三方依赖：只用 Python 标准库（tkinter + sys.settrace）。
 """
 
+import ast
 import queue
 import sys
 import threading
@@ -72,7 +73,7 @@ _PY_MERGE = '''def solve(head, head2):
 '''
 
 # 链表模板共用的准备代码：定义 ListNode、把输入构建成 head
-_LIST_SETUP = '''class ListNode:
+_LISTNODE_SETUP = '''class ListNode:
     def __init__(self, val=0, next=None):
         self.val = val
         self.next = next
@@ -84,8 +85,20 @@ def build_list(vals):
         cur.next = ListNode(v)
         cur = cur.next
     return dummy.next
+'''
 
+_LIST_SETUP = _LISTNODE_SETUP + '''
 head = build_list(nums)
+'''
+
+# 用户代码已自带 ListNode、但没有 build_list 时，只补一个 build_list
+_BUILD_LIST_SETUP = '''def build_list(vals):
+    dummy = ListNode(0)
+    cur = dummy
+    for v in vals:
+        cur.next = ListNode(v)
+        cur = cur.next
+    return dummy.next
 '''
 
 # 合并两个有序链表：构建 head 和 head2
@@ -129,6 +142,22 @@ head = build_list_with_cycle(nums, target if target is not None else -1)
 #   python_ref - 模拟模式下真正执行的等价 Python 脚本（仅 cpp/java）
 #   line_map   - 模拟模式下 python_ref 行号 -> 显示代码行号
 TEMPLATES = {
+    'Python - 自定义代码': {
+        'lang': 'python',
+        'nums': '1 3 5 7 9',
+        'target': '7',
+        'code': '''# 自定义代码模板：把下面的 solve 改成你自己的算法即可运行。
+# 数组类：def solve(nums, target):   （或 def solve(nums):）
+# 链表类：def solve(head, target):   （无需自己定义 ListNode）
+# 合并两个链表：def solve(head, head2):
+#
+# 也可以不写 solve，直接把整个文件当主程序写，
+# 例如：for i in range(len(nums)): print(nums[i])
+def solve(nums, target):
+    # 在这里写你的代码
+    return -1
+''',
+    },
     'Python - 二分查找': {
         'lang': 'python',
         'nums': '1 3 5 7 9 11 13 15',
@@ -620,6 +649,43 @@ def _serialize_listnode(node):
             'cycle_to': cycle_to}
 
 
+def infer_setup_and_entry(fn, env):
+    """根据用户自定义代码里的 solve 签名，推断执行环境与入口表达式。
+
+    约定（与使用说明一致）：
+      * solve(nums, target) / solve(nums)      -> 数组类，无需准备代码
+      * solve(head, target) / solve(head)      -> 链表类，自动注入 ListNode
+                                                 并把 nums 构建成 head
+      * solve(head, head2)                     -> 合并两个链表，nums/nums2
+                                                 分别构建成 head/head2
+    返回 (setup, entry)；setup 为要追加执行的准备代码（可能为空字符串）。
+    """
+    args = fn.__code__.co_varnames[:fn.__code__.co_argcount]
+    setup = ''
+    if args and args[0] == 'head':
+        # 链表类：用户代码没定义 ListNode 时补上，缺 build_list 时补上
+        if 'ListNode' not in env:
+            setup += _LISTNODE_SETUP
+        elif 'build_list' not in env:
+            setup += _BUILD_LIST_SETUP
+        if len(args) >= 2 and args[1] == 'head2':
+            setup += ('head = build_list(nums)\n'
+                      'head2 = build_list(nums2 if nums2 is not None else [])\n')
+            entry = 'solve(head, head2)'
+        else:
+            setup += 'head = build_list(nums)\n'
+            entry = 'solve(head, target)' if len(args) >= 2 else 'solve(head)'
+    else:
+        # 数组类或其他参数名：位置传参，不依赖参数名
+        if len(args) == 0:
+            entry = 'solve()'
+        elif len(args) == 1:
+            entry = 'solve(nums)'
+        else:
+            entry = 'solve(nums, target)'
+    return setup, entry
+
+
 class AlgorithmStepper:
     def __init__(self):
         self.q = queue.Queue()          # 快照/结果队列（线程安全）
@@ -628,22 +694,43 @@ class AlgorithmStepper:
         self.stop_flag = threading.Event()
         self.code_obj = None
 
-    def run(self, code, nums, target, setup='',
-            entry='solve(nums, target)', nums2=None):
+    def run(self, code, nums, target, setup=None,
+            entry=None, nums2=None):
         """在后台线程中编译并执行用户代码，每行暂停。
 
         setup：执行用户代码前先执行的准备代码（如定义 ListNode、构建链表）。
         entry：实际调用的入口表达式，例如 solve(head, target)。
         nums2：第二组数据（合并两个链表等场景使用，None 表示空）。
+
+        两种模式：
+          * 代码里定义了 solve 函数 -> 只逐步执行 solve（模板 / 自定义代码）
+          * 代码里没有 solve 函数  -> 任意代码模式：把整个文件当作
+            主程序逐步执行，顶层语句和文件内定义的函数都会逐行高亮。
         """
         try:
-            env = {'nums': nums, 'target': target, 'nums2': nums2}
-            if setup:
-                exec(compile(setup, '<setup>', 'exec'), env)
-            exec(compile(code, '<algo>', 'exec'), env)
+            tree = ast.parse(code)
+            compiled = compile(tree, '<algo>', 'exec')
+        except SyntaxError as e:
+            self.q.put({'type': 'error',
+                        'message': '代码编译失败：SyntaxError: %s' % e})
+            return
+
+        env = {'nums': nums, 'target': target, 'nums2': nums2}
+        has_solve = any(isinstance(node, ast.FunctionDef)
+                        and node.name == 'solve' for node in tree.body)
+
+        if has_solve:
+            self._run_solve_mode(compiled, env, setup, entry)
+        else:
+            self._run_script_mode(tree, compiled, env)
+
+    def _run_solve_mode(self, compiled, env, setup, entry):
+        """函数模式：执行代码拿到 solve，推断环境后逐步执行 solve。"""
+        try:
+            exec(compiled, env)
         except Exception as e:
             self.q.put({'type': 'error',
-                        'message': '代码编译失败：%s: %s' % (type(e).__name__, e)})
+                        'message': '代码运行失败：%s: %s' % (type(e).__name__, e)})
             return
 
         fn = env.get('solve')
@@ -651,6 +738,20 @@ class AlgorithmStepper:
             self.q.put({'type': 'error',
                         'message': '代码里没有定义 solve 函数'})
             return
+
+        if setup is None or entry is None:
+            auto_setup, auto_entry = infer_setup_and_entry(fn, env)
+            setup = auto_setup if setup is None else setup
+            entry = auto_entry if entry is None else entry
+
+        if setup:
+            try:
+                exec(compile(setup, '<setup>', 'exec'), env)
+            except Exception as e:
+                self.q.put({'type': 'error',
+                            'message': '准备代码执行失败：%s: %s'
+                                       % (type(e).__name__, e)})
+                return
 
         self.code_obj = fn.__code__
         old_trace = sys.gettrace()
@@ -682,6 +783,72 @@ class AlgorithmStepper:
         finally:
             sys.settrace(old_trace)
 
+    def _run_script_mode(self, tree, compiled, env):
+        """任意代码模式：逐步执行整个文件（含顶层语句和自定义函数）。"""
+        if not tree.body:
+            self.q.put({'type': 'error',
+                        'message': '代码为空，请输入要运行的 Python 代码'})
+            return
+
+        # 用到 ListNode / build_list 但没定义时，自动注入链表环境，
+        # 方便直接写链表代码（例如 head = build_list(nums)）
+        defines_listnode = any(isinstance(node, ast.ClassDef)
+                               and node.name == 'ListNode'
+                               for node in tree.body)
+        defines_build_list = any(isinstance(node, ast.FunctionDef)
+                                 and node.name == 'build_list'
+                                 for node in tree.body)
+        used_names = {node.id for node in ast.walk(tree)
+                      if isinstance(node, ast.Name)}
+        uses_listnode = 'ListNode' in used_names
+        uses_build_list = 'build_list' in used_names
+        if (uses_listnode or uses_build_list) and not defines_listnode:
+            try:
+                exec(compile(_LISTNODE_SETUP, '<setup>', 'exec'), env)
+            except Exception as e:
+                self.q.put({'type': 'error',
+                            'message': '准备代码执行失败：%s: %s'
+                                       % (type(e).__name__, e)})
+                return
+        elif uses_build_list and not defines_build_list:
+            try:
+                exec(compile(_BUILD_LIST_SETUP, '<setup>', 'exec'), env)
+            except Exception as e:
+                self.q.put({'type': 'error',
+                            'message': '准备代码执行失败：%s: %s'
+                                       % (type(e).__name__, e)})
+                return
+
+        self.code_obj = compiled
+        old_trace = sys.gettrace()
+
+        def script_tracer(frame, event, arg):
+            if self.stop_flag.is_set():
+                raise _StopExecution()
+            # 只跟踪本次打开的文件里的代码（顶层 + 其中定义的函数）
+            if frame.f_code.co_filename == '<algo>':
+                if event == 'line':
+                    self._pause(frame)
+            return script_tracer
+
+        sys.settrace(script_tracer)
+        try:
+            exec(compiled, env)
+        except _StopExecution:
+            self.q.put({'type': 'stopped'})
+            return
+        except Exception as e:
+            self.q.put({'type': 'error',
+                        'message': '%s: %s' % (type(e).__name__, e)})
+            return
+        finally:
+            sys.settrace(old_trace)
+
+        # 整个文件执行完毕（模块级变量都在 env 里）
+        self.q.put({'type': 'done',
+                    'result': None,
+                    'vars': self._snapshot_mapping(env)})
+
     def _pause(self, frame):
         self.q.put({'type': 'line',
                     'lineno': frame.f_lineno,
@@ -693,8 +860,13 @@ class AlgorithmStepper:
 
     @staticmethod
     def _snapshot_vars(frame):
+        return AlgorithmStepper._snapshot_mapping(frame.f_locals)
+
+    @staticmethod
+    def _snapshot_mapping(mapping):
+        """把变量字典转换成可发给 GUI 的快照（跳过不可绘制对象）。"""
         out = {}
-        for k, v in frame.f_locals.items():
+        for k, v in mapping.items():
             if k.startswith('__'):
                 continue
             if isinstance(v, (int, float, str, bool)) or v is None:
@@ -1186,14 +1358,17 @@ class App:
 
         ttk.Label(top, text='算法模板:').pack(side=tk.LEFT)
         self.template_combo = ttk.Combobox(
-            top, values=list(TEMPLATES.keys()), state='readonly', width=10)
+            top, values=list(TEMPLATES.keys()), state='readonly', width=24)
         self.template_combo.pack(side=tk.LEFT, padx=(4, 10))
         self.template_combo.bind('<<ComboboxSelected>>',
                                  self.on_template_selected)
 
         self.open_btn = ttk.Button(top, text='打开文件...',
                                    command=self.open_file)
-        self.open_btn.pack(side=tk.LEFT, padx=(0, 16))
+        self.open_btn.pack(side=tk.LEFT, padx=(0, 6))
+        self.new_btn = ttk.Button(top, text='新建自定义代码',
+                                  command=self.new_custom)
+        self.new_btn.pack(side=tk.LEFT, padx=(0, 16))
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y,
                                                     padx=8)
@@ -1367,7 +1542,8 @@ class App:
         lang = meta.get('lang', 'python')
         mode_text = '真执行' if lang == 'python' else '模拟模式'
         if lang == 'python':
-            frame_text = '代码（可修改，必须定义 solve(nums, target)）'
+            frame_text = ('代码（可修改：定义 solve 逐步执行该函数；'
+                          '不定义 solve 则逐步执行整个文件）')
         else:
             frame_text = ('代码（%s 模拟模式：按内置演示逻辑执行，'
                           '改代码不会改变步骤）' % lang.upper())
@@ -1375,6 +1551,16 @@ class App:
         self.root.title('算法可视化 — %s' % name)
         self.status_var.set('已载入模板：%s（%s）' % (name, mode_text))
         self.log('[就绪] 已载入模板：%s（%s）' % (name, mode_text))
+
+    def new_custom(self):
+        """切到自定义代码模板：给出可编辑的 solve 起步代码。"""
+        name = 'Python - 自定义代码'
+        current = self.code_text.get('1.0', 'end-1c').strip()
+        if current and current != TEMPLATES[name]['code'].strip():
+            if not messagebox.askyesno(
+                    '新建自定义代码', '这会覆盖当前编辑器里的代码，确定吗？'):
+                return
+        self.load_template(name)
 
     def on_template_selected(self, _event=None):
         name = self.template_combo.get()
@@ -1411,7 +1597,8 @@ class App:
         self.current_template = None
         self.line_map = None
         self.code_frame.config(
-            text='代码（已打开文件：按 Python 执行，需定义 solve 函数）')
+            text='代码（已打开文件：按 Python 执行；定义 solve 则逐步执行该函数，'
+                 '否则逐步执行整个文件）')
         self.root.title('算法可视化 — %s' % path)
         self.status_var.set('已打开文件：%s（将停留在这个文件）' % path)
         self.log('[就绪] 已打开文件：%s' % path)
@@ -1434,15 +1621,15 @@ class App:
         code = self.code_text.get('1.0', 'end-1c')
         meta = TEMPLATES.get(self.current_template)
         lang = meta.get('lang', 'python') if meta else 'python'
-        setup = meta.get('setup', '') if meta else ''
-        entry = meta.get('entry', 'solve(nums, target)') if meta \
-            else 'solve(nums, target)'
+        # 模板给显式 setup/entry；自定义代码 / 打开文件时为 None，
+        # 由 AlgorithmStepper 根据 solve 的签名自动推断。
+        setup = meta.get('setup') if meta else None
+        entry = meta.get('entry') if meta else None
         if lang == 'python':
             exec_code = code
             self.line_map = None
-            if 'def solve' not in code:
-                messagebox.showerror(
-                    '提示', '代码里需要定义 solve(nums, target) 函数')
+            if not code.strip():
+                messagebox.showerror('提示', '代码为空，请输入要运行的 Python 代码')
                 return
         else:
             # 模拟模式：执行内置等价脚本，代码编辑器只负责显示对应语言
@@ -1577,8 +1764,12 @@ class App:
             self.running = False
             self.set_buttons_running(False)
             self.stop_play()
-            self.status_var.set('执行完成，返回值 = %s' % fmt_value(result))
-            self.log('[完成] 返回值 = %s' % fmt_value(result))
+            if result is None:
+                self.status_var.set('执行完成')
+                self.log('[完成] 执行完成')
+            else:
+                self.status_var.set('执行完成，返回值 = %s' % fmt_value(result))
+                self.log('[完成] 返回值 = %s' % fmt_value(result))
         elif t == 'error':
             self.running = False
             self.set_buttons_running(False)
